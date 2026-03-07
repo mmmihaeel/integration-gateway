@@ -58,7 +58,8 @@ describe('Processing retries and status transitions', () => {
     const scheduledRetry = await runtime.container.rabbitMqClient.pullOneMessage<{
       normalizedEventId: string;
       attemptNo: number;
-      triggeredBy: string;
+      triggeredBy: 'webhook' | 'retry' | 'replay';
+      correlationId: string;
     }>('retryQueue');
 
     expect(scheduledRetry).not.toBeNull();
@@ -67,17 +68,29 @@ describe('Processing retries and status transitions', () => {
     expect(scheduledRetry?.triggeredBy).toBe('retry');
 
     await runtime.container.services.processingService.processMessage({
-      normalizedEventId: eventId,
-      attemptNo: 2,
-      triggeredBy: 'retry',
-      correlationId: 'corr-retry-1',
+      normalizedEventId: scheduledRetry!.normalizedEventId,
+      attemptNo: scheduledRetry!.attemptNo,
+      triggeredBy: scheduledRetry!.triggeredBy,
+      correlationId: scheduledRetry!.correlationId,
     });
 
+    const finalRetry = await runtime.container.rabbitMqClient.pullOneMessage<{
+      normalizedEventId: string;
+      attemptNo: number;
+      triggeredBy: 'webhook' | 'retry' | 'replay';
+      correlationId: string;
+    }>('retryQueue');
+
+    expect(finalRetry).not.toBeNull();
+    expect(finalRetry?.normalizedEventId).toBe(eventId);
+    expect(finalRetry?.attemptNo).toBe(3);
+    expect(finalRetry?.triggeredBy).toBe('retry');
+
     await runtime.container.services.processingService.processMessage({
-      normalizedEventId: eventId,
-      attemptNo: 3,
-      triggeredBy: 'retry',
-      correlationId: 'corr-retry-1',
+      normalizedEventId: finalRetry!.normalizedEventId,
+      attemptNo: finalRetry!.attemptNo,
+      triggeredBy: finalRetry!.triggeredBy,
+      correlationId: finalRetry!.correlationId,
     });
 
     const statusResponse = await runtime.app.inject({
