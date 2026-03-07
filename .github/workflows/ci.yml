@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: integration_gateway
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d integration_gateway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      NODE_ENV: test
+      APP_HOST: 127.0.0.1
+      APP_PORT: 3100
+      LOG_LEVEL: warn
+      DATABASE_URL: postgres://app:app@127.0.0.1:5432/integration_gateway
+      REDIS_URL: redis://127.0.0.1:6379
+      RABBITMQ_URL: amqp://guest:guest@127.0.0.1:5672
+      RABBITMQ_PROCESS_QUEUE: ig.test.events.process
+      RABBITMQ_RETRY_QUEUE: ig.test.events.retry
+      RABBITMQ_REPLAY_QUEUE: ig.test.events.replay
+      WEBHOOK_RATE_LIMIT_PER_MINUTE: 120
+      IDEMPOTENCY_TTL_SECONDS: 86400
+      PROCESSING_LOCK_TTL_SECONDS: 60
+      MAX_PROCESSING_RETRIES: 3
+      RETRY_BASE_DELAY_MS: 50
+      DB_MIGRATIONS_TABLE: schema_migrations
+      MANAGEMENT_API_KEY: test-management-api-key
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Validate Docker Compose
+        run: docker compose config > /dev/null

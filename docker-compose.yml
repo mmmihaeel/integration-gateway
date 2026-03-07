@@ -1,0 +1,157 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: integration_gateway
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - '5434:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d integration_gateway']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6381:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrator:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+    environment:
+      NODE_ENV: development
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://app:app@postgres:5432/integration_gateway
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_PROCESS_QUEUE: ig.events.process
+      RABBITMQ_RETRY_QUEUE: ig.events.retry
+      RABBITMQ_REPLAY_QUEUE: ig.events.replay
+      WEBHOOK_RATE_LIMIT_PER_MINUTE: 120
+      IDEMPOTENCY_TTL_SECONDS: 86400
+      PROCESSING_LOCK_TTL_SECONDS: 60
+      MAX_PROCESSING_RETRIES: 3
+      RETRY_BASE_DELAY_MS: 5000
+      DB_MIGRATIONS_TABLE: schema_migrations
+      MANAGEMENT_API_KEY: local-internal-management-key
+    command: ['sh', '-c', 'npm run db:migrate && npm run db:seed']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+    environment:
+      NODE_ENV: development
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://app:app@postgres:5432/integration_gateway
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_PROCESS_QUEUE: ig.events.process
+      RABBITMQ_RETRY_QUEUE: ig.events.retry
+      RABBITMQ_REPLAY_QUEUE: ig.events.replay
+      WEBHOOK_RATE_LIMIT_PER_MINUTE: 120
+      IDEMPOTENCY_TTL_SECONDS: 86400
+      PROCESSING_LOCK_TTL_SECONDS: 60
+      MAX_PROCESSING_RETRIES: 3
+      RETRY_BASE_DELAY_MS: 5000
+      DB_MIGRATIONS_TABLE: schema_migrations
+      MANAGEMENT_API_KEY: local-internal-management-key
+    command: ['npm', 'run', 'start']
+    ports:
+      - '3000:3000'
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:3000/api/v1/health >/dev/null || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+    environment:
+      NODE_ENV: development
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://app:app@postgres:5432/integration_gateway
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_PROCESS_QUEUE: ig.events.process
+      RABBITMQ_RETRY_QUEUE: ig.events.retry
+      RABBITMQ_REPLAY_QUEUE: ig.events.replay
+      WEBHOOK_RATE_LIMIT_PER_MINUTE: 120
+      IDEMPOTENCY_TTL_SECONDS: 86400
+      PROCESSING_LOCK_TTL_SECONDS: 60
+      MAX_PROCESSING_RETRIES: 3
+      RETRY_BASE_DELAY_MS: 5000
+      DB_MIGRATIONS_TABLE: schema_migrations
+      MANAGEMENT_API_KEY: local-internal-management-key
+    command: ['npm', 'run', 'worker']
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - '8082:80'
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

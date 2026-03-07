@@ -1,0 +1,52 @@
+{
+  "name": "integration-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend integration service for webhook ingestion, normalization, idempotent processing, retries, replay, and delivery tracking.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/api/server.ts",
+    "start": "node dist/api/server.js",
+    "build": "tsc -p tsconfig.build.json",
+    "worker:dev": "tsx watch src/worker/worker.ts",
+    "worker": "node dist/worker/worker.js",
+    "db:migrate": "tsx src/infrastructure/db/migrate.ts",
+    "db:seed": "tsx src/infrastructure/db/seed.ts",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage",
+    "test:integration": "vitest run tests/integration",
+    "test:unit": "vitest run tests/unit",
+    "verify": "npm run lint && npm run format && npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.5",
+    "dotenv": "^16.4.5",
+    "fast-json-stable-stringify": "^2.1.0",
+    "fastify": "^4.29.0",
+    "fastify-raw-body": "^4.3.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.14.0",
+    "@types/amqplib": "^0.10.6",
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^9.14.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.14.0",
+    "vitest": "^2.1.8"
+  }
+}
