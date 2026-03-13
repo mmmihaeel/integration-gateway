@@ -1,8 +1,14 @@
 # API Overview
 
+Related: [README](../README.md) | [Architecture](architecture.md) | [Webhook Flow](webhook-flow.md) | [Security](security.md)
+
 Base path: `/api/v1`
 
-All success responses:
+The API surface is deliberately small. The public side accepts health checks and inbound webhooks, while the management side exposes event, delivery, and audit views for operators.
+
+## Response Contract
+
+All success responses use:
 
 ```json
 {
@@ -12,7 +18,7 @@ All success responses:
 }
 ```
 
-All error responses:
+All error responses use:
 
 ```json
 {
@@ -25,10 +31,14 @@ All error responses:
 }
 ```
 
-## Authentication Model
+## Authentication and Access Model
 
-- Webhook endpoints use provider-specific verification headers.
-- Management/query endpoints require `x-internal-api-key` matching `MANAGEMENT_API_KEY`.
+| Route family           | Access model                           | Notes                                                                   |
+| ---------------------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| Health                 | Public                                 | Returns `200` when all dependencies are healthy and `503` when degraded |
+| Webhook ingress        | Provider-specific verification headers | `acme` uses HMAC, `globex` uses shared token verification               |
+| Management routes      | `x-internal-api-key`                   | Compared with `MANAGEMENT_API_KEY` using constant-time equality         |
+| Internal delivery sink | No management key, non-production only | Disabled entirely when `NODE_ENV=production`                            |
 
 Protected routes:
 
@@ -36,68 +46,83 @@ Protected routes:
 - `GET /events`
 - `GET /events/:id`
 - `GET /events/:id/status`
+- `GET /processing-status/:id`
 - `POST /events/:id/replay`
 - `GET /deliveries`
 - `GET /audit-entries`
-- `GET /processing-status/:id`
 
-Public routes:
+## Endpoint Families
 
-- `GET /health`
-- `POST /webhooks/:provider`
+| Method and path                          | Purpose                                                                             |
+| ---------------------------------------- | ----------------------------------------------------------------------------------- |
+| `GET /health`                            | Report PostgreSQL, Redis, and RabbitMQ health                                       |
+| `POST /webhooks/:provider`               | Authenticate, normalize, persist, and enqueue an inbound provider event             |
+| `GET /integrations`                      | List configured integrations, optionally filtered by provider or active state       |
+| `GET /events`                            | Paginated event search over normalized events                                       |
+| `GET /events/:id`                        | Event detail including raw webhook snapshot, delivery attempts, and processing jobs |
+| `GET /events/:id/status`                 | Current event status, attempt count, last error, and recent jobs                    |
+| `GET /processing-status/:id`             | Alias for the status view, useful for polling clients                               |
+| `POST /events/:id/replay`                | Create a replay request and queue replay dispatch                                   |
+| `GET /deliveries`                        | Paginated delivery-attempt listing                                                  |
+| `GET /audit-entries`                     | Paginated audit history listing                                                     |
+| `POST /internal/delivery-sink/:provider` | Local helper endpoint used by seeded integrations to validate worker deliveries     |
 
-## Health
+## Webhook Provider Contracts
 
-### `GET /health`
+| Provider | Verification header | Expected payload shape                                           |
+| -------- | ------------------- | ---------------------------------------------------------------- |
+| `acme`   | `x-acme-signature`  | `eventId`, `eventType`, `occurredAt`, optional `subject`, `data` |
+| `globex` | `x-globex-token`    | `id`, `type`, `timestamp`, `resource`                            |
 
-Returns dependency status for PostgreSQL, Redis, and RabbitMQ.
+Webhook ingress behavior:
 
-## Integrations
+- Returns `202` when a new event is accepted and queued.
+- Returns `200` when the request resolves to an existing event via idempotency.
+- Rejects invalid provider credentials with `401`.
+- Rejects malformed or non-object payloads with `400`.
 
-### `GET /integrations` (management key required)
+## Query and Filter Surface
 
-Query params:
+### `GET /integrations`
 
-- `provider` (optional)
-- `activeOnly=true|false` (optional)
+| Query parameter                         | Meaning                         |
+| --------------------------------------- | ------------------------------- |
+| `provider`                              | Filter by provider key          |
+| `activeOnly=true` or `activeOnly=false` | Restrict to active integrations |
 
-## Webhooks
+### `GET /events`
 
-### `POST /webhooks/:provider`
+| Query parameter    | Meaning                                                           |
+| ------------------ | ----------------------------------------------------------------- |
+| `page`, `pageSize` | Pagination                                                        |
+| `provider`         | Filter by provider key                                            |
+| `status`           | One of `pending`, `processing`, `processed`, `retrying`, `failed` |
+| `eventType`        | Filter by normalized event type                                   |
+| `subject`          | Partial subject match                                             |
+| `from`, `to`       | Time-range filter against `occurredAt`                            |
+| `sortBy`           | `createdAt`, `occurredAt`, `status`, `receivedAt`                 |
+| `sortOrder`        | `asc` or `desc`                                                   |
 
-Ingests provider payload, verifies authenticity, normalizes data, persists records, and enqueues async processing.
+### `GET /deliveries`
 
-Provider headers:
+| Query parameter    | Meaning                               |
+| ------------------ | ------------------------------------- |
+| `page`, `pageSize` | Pagination                            |
+| `status`           | `success` or `failed`                 |
+| `eventId`          | Restrict to a single normalized event |
 
-- `acme`: `x-acme-signature` (hex HMAC SHA256 of raw JSON body)
-- `globex`: `x-globex-token` (shared token)
+### `GET /audit-entries`
 
-Behavior:
+| Query parameter    | Meaning                |
+| ------------------ | ---------------------- |
+| `page`, `pageSize` | Pagination             |
+| `entityType`       | Filter by entity group |
+| `entityId`         | Filter by entity id    |
+| `action`           | Filter by action name  |
 
-- `202` for newly queued events
-- `200` for duplicate events (idempotency hit)
+## Replay Semantics
 
-## Events
-
-### `GET /events` (management key required)
-
-Query params:
-
-- Pagination: `page`, `pageSize`
-- Filters: `provider`, `status`, `eventType`, `subject`, `from`, `to`
-- Sorting: `sortBy=createdAt|occurredAt|status|receivedAt`, `sortOrder=asc|desc`
-
-### `GET /events/:id` (management key required)
-
-Returns event details with raw webhook snapshot, delivery attempts, and processing jobs.
-
-### `GET /events/:id/status` (management key required)
-
-Returns current status, attempts, last error, and recent processing jobs.
-
-### `POST /events/:id/replay` (management key required)
-
-Body:
+`POST /events/:id/replay` accepts:
 
 ```json
 {
@@ -106,31 +131,20 @@ Body:
 }
 ```
 
-Returns replay request id and target event id.
+Replay behavior:
 
-## Deliveries
+- Returns `202` with `replayRequestId` and `eventId`.
+- Persists the replay request before queue publication.
+- Writes audit history for replay initiation and dispatch.
+- Does not currently expose a standalone replay-request query route.
 
-### `GET /deliveries` (management key required)
+## Local Delivery Sink
 
-Query params:
+The internal delivery sink exists only to keep the worker path testable in local and test environments. Seeded integrations point their callback URLs at:
 
-- `page`, `pageSize`
-- `status=success|failed`
-- `eventId`
+- `/api/v1/internal/delivery-sink/acme`
+- `/api/v1/internal/delivery-sink/globex`
 
-## Audit Entries
+If the payload or nested payload data contains `simulateFailure: true`, the sink returns a `500` response so retry behavior can be exercised intentionally.
 
-### `GET /audit-entries` (management key required)
-
-Query params:
-
-- `page`, `pageSize`
-- `entityType`
-- `entityId`
-- `action`
-
-## Processing Status Alias
-
-### `GET /processing-status/:id` (management key required)
-
-Alias for event status view, useful for operational polling clients.
+For lifecycle detail beyond the route surface, see [webhook-flow.md](webhook-flow.md).

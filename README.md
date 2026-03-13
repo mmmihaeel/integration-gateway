@@ -1,229 +1,162 @@
 # integration-gateway
 
-`integration-gateway` is a backend service for ingesting third-party webhooks, normalizing payloads into a canonical event model, processing events asynchronously, and tracking delivery outcomes with retry and replay controls.
+TypeScript webhook ingestion gateway for idempotent event processing, retries, replay, and delivery tracking.
 
-The project is intentionally scoped as a realistic portfolio backend: clear architecture, practical reliability patterns, testable domain logic, and a Docker-first developer workflow.
+`integration-gateway` is a reviewer-friendly backend project that treats webhook ingestion as a real systems problem instead of a thin HTTP controller. The repository shows provider-specific verification at the edge, canonical event normalization, durable PostgreSQL state, RabbitMQ-backed worker processing, Redis-backed control paths, and explicit replay and audit workflows.
 
-## Business Context
+## Quick Navigation
 
-External webhook providers differ in payload shape, signature model, and delivery guarantees. This service centralizes those concerns so downstream systems consume a consistent integration contract.
+- [Why This Repository Matters](#why-this-repository-matters)
+- [Architecture Overview](#architecture-overview)
+- [Event Lifecycle and Processing Model](#event-lifecycle-and-processing-model)
+- [Capability Matrix](#capability-matrix)
+- [API Overview](#api-overview)
+- [Local Workflow](#local-workflow)
+- [Validation and Quality](#validation-and-quality)
+- [Repository Structure](#repository-structure)
+- [Docs Map](#docs-map)
+- [Scope Boundaries](#scope-boundaries)
+- [Future Improvements](#future-improvements)
 
-## Feature Highlights
+## Why This Repository Matters
 
-- Multi-provider webhook ingestion with provider-specific verification
-- Raw webhook persistence plus normalized event storage
-- Layered idempotency controls (Redis marker + PostgreSQL uniqueness)
-- Asynchronous processing with RabbitMQ process/retry/replay queues
-- Delivery attempt tracking with status, HTTP metadata, and latency
-- Replay requests with explicit actor and reason
-- Processing status and audit-history query endpoints
-- Search/filter/sort/paginated operational APIs
-- Docker Compose stack for API, worker, migrator, PostgreSQL, Redis, RabbitMQ, and Nginx
+Most webhook samples stop at "receive JSON and write a row." This repository goes further in the places that matter for backend and integration work:
 
-## Supported Providers
+- It handles provider-specific verification and normalization before events reach the rest of the system.
+- It keeps raw inbound payloads, normalized events, delivery attempts, replay requests, and audit entries as separate operational records.
+- It models queue-backed worker execution, idempotency, retries, and replay as first-class lifecycle concerns rather than afterthoughts.
+- It runs locally with a production-shaped stack: API and worker processes over PostgreSQL, RabbitMQ, and Redis.
 
-| Provider | Verification model             | Required headers   | Expected payload keys                        |
-| -------- | ------------------------------ | ------------------ | -------------------------------------------- |
-| `acme`   | HMAC SHA256 over raw JSON body | `x-acme-signature` | `eventId`, `eventType`, `occurredAt`, `data` |
-| `globex` | Shared-token check             | `x-globex-token`   | `id`, `type`, `timestamp`, `resource`        |
+## Architecture Overview
 
-Seeded local secrets:
+The runtime is intentionally split between synchronous ingress responsibilities and asynchronous delivery work. The API process authenticates and persists inbound webhooks, while the worker process owns delivery attempts, retry scheduling, and replay execution.
 
-- `acme`: `acme-demo-secret`
-- `globex`: `globex-demo-secret`
+| Component      | Responsibility                                                                                                                               |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastify API    | Accept webhooks, verify provider auth, normalize payloads, write durable records, enqueue work, expose management APIs                       |
+| Worker runtime | Consume process and replay queues, acquire event locks, deliver outbound callbacks, schedule retries, complete replay requests               |
+| PostgreSQL     | System of record for integrations, webhook events, normalized events, processing jobs, delivery attempts, replay requests, and audit entries |
+| RabbitMQ       | Durable async transport for process, retry, and replay queues                                                                                |
+| Redis          | Rate limiting, idempotency markers, processing locks, and short-lived integration cache                                                      |
 
-## Technology Stack
+```mermaid
+flowchart LR
+    Provider["Webhook provider"] --> API["Fastify API"]
+    API --> Verify["Provider verification"]
+    Verify --> Normalize["Payload normalization"]
+    Normalize --> Idempotency["Redis marker + PostgreSQL uniqueness"]
+    Idempotency --> Persist["Persist webhook, event, jobs, audit"]
+    Persist --> ProcessQueue["RabbitMQ process queue"]
+    ProcessQueue --> Worker["Worker runtime"]
+    Worker --> Delivery["HTTP callback delivery"]
+    Worker --> RetryQueue["RabbitMQ retry queue"]
+    RetryQueue -->|"TTL + dead-letter"| ProcessQueue
+    ReplayAPI["Replay endpoint"] --> ReplayQueue["RabbitMQ replay queue"]
+    ReplayQueue --> ProcessQueue
+    Persist --> Postgres["PostgreSQL"]
+    Idempotency --> Redis["Redis"]
+    Worker --> Postgres
+```
 
-- Node.js 20 + TypeScript
-- Fastify
-- PostgreSQL 16
-- RabbitMQ 3.13
-- Redis 7
-- Docker + Docker Compose
-- Vitest + ESLint + Prettier
-- GitHub Actions CI
+The implemented flow is:
 
-## Architecture Summary
+1. `POST /api/v1/webhooks/:provider` receives a provider payload and preserves the raw body for verification.
+2. A provider-specific verifier checks `x-acme-signature` or `x-globex-token`.
+3. A provider normalizer maps the payload into a canonical internal event shape.
+4. The service computes an idempotency key and attempts duplicate suppression in Redis before relying on PostgreSQL uniqueness.
+5. Raw webhook data, normalized event data, initial processing-job records, and audit entries are written to PostgreSQL.
+6. The API publishes a process message to RabbitMQ.
+7. The worker consumes the message, locks the event in Redis, attempts outbound delivery, and records delivery outcomes.
+8. Failed deliveries either schedule a delayed retry or transition the event to a terminal `failed` state.
+9. Manual replay requests enqueue a replay workflow that feeds the event back into the process queue with a tracked replay request record.
 
-- `src/api`: routes, request parsing/validation, response/error contracts
-- `src/application`: ingestion, replay, query, and processing orchestration services
-- `src/domain`: domain errors and shared contracts
-- `src/infrastructure`: PostgreSQL repositories, Redis adapters, RabbitMQ adapter, outbound HTTP delivery client
-- `src/worker`: queue consumers for replay dispatch and event processing
+## Event Lifecycle and Processing Model
 
-Detailed design notes:
+The repository separates storage by lifecycle stage so operators can answer different questions without overloading a single table or API view.
 
-- [Architecture](docs/architecture.md)
-- [Domain Model](docs/domain-model.md)
-- [API Overview](docs/api-overview.md)
-- [Webhook Flow](docs/webhook-flow.md)
-- [Security](docs/security.md)
+| Record              | Why it exists                                                                                         | Written by                         | Where it is surfaced                                           |
+| ------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------- | -------------------------------------------------------------- |
+| `webhook_events`    | Preserves raw payload, inbound headers, source IP, external event id, and idempotency key             | API ingestion path                 | `GET /events/:id`                                              |
+| `normalized_events` | Canonical internal event used for queue processing and status tracking                                | API ingestion path, worker updates | `GET /events`, `GET /events/:id`, `GET /events/:id/status`     |
+| `processing_jobs`   | Tracks queue scheduling and worker execution history; multiple records can exist for the same attempt | API, replay service, worker        | `GET /events/:id`, `GET /events/:id/status`                    |
+| `delivery_attempts` | Records each outbound callback attempt with HTTP metadata and latency                                 | Worker                             | `GET /deliveries`, `GET /events/:id`                           |
+| `replay_requests`   | Stores explicit operator-driven replay intent with actor and reason                                   | Replay endpoint and replay worker  | Persisted for lifecycle control; no standalone query route yet |
+| `audit_entries`     | Append-only operational history for ingestion, queueing, retries, failures, and replay actions        | API, replay service, worker        | `GET /audit-entries`                                           |
 
-## Webhook Ingestion Flow
+### Idempotency Strategy
 
-1. `POST /api/v1/webhooks/:provider` receives JSON payload and provider headers.
-2. Provider verification runs (`x-acme-signature` or `x-globex-token`).
-3. Provider normalizer maps payload into internal event shape.
-4. Idempotency key is built from `provider + external_event_id` (or payload hash fallback).
-5. Raw webhook and normalized event are persisted in PostgreSQL.
-6. Event is published to RabbitMQ process queue.
-7. Worker processes outbound delivery and records attempts/jobs/audit entries.
-8. Failures schedule retries until max retry count is reached.
+- First-pass duplicate suppression uses Redis `SET NX EX` markers keyed by the computed idempotency key.
+- Durable duplicate protection uses the PostgreSQL unique constraint on `webhook_events.idempotency_key`.
+- The preferred key is `provider:externalEventId`.
+- If a provider payload does not carry a stable external id, the fallback key is `provider:payload:<sha256(stable-json)>`.
+- If Redis is unavailable, the system falls back to PostgreSQL uniqueness rather than silently disabling duplicate protection.
 
-## Idempotency Strategy
+### Retry and Replay Control Loops
 
-- First-pass deduplication: Redis `SET NX EX` marker keyed by idempotency key
-- Durable deduplication: PostgreSQL unique constraint on `webhook_events.idempotency_key`
-- Key strategy:
-  - preferred: `provider + external_event_id`
-  - fallback: stable hash of normalized payload
+- Process failures move the event to `retrying`, record a queued retry job, and publish a delayed message to `ig.events.retry`.
+- The retry queue uses message expiration and dead-letter routing back to `ig.events.process`, which keeps the retry path inside RabbitMQ instead of depending on an external scheduler.
+- Manual replay requests create a `replay_requests` row, capture `requestedBy` and `reason`, write audit history, and enqueue a replay message to `ig.events.replay`.
+- Replay dispatch resets the event to `pending`, records a replay-triggered process job, and republishes work to the main process queue.
 
-This handles high-frequency duplicates and race conditions consistently.
+## Capability Matrix
 
-## Replay and Retry Flow
-
-- Worker marks processing transitions (`pending -> processing -> processed/failed`)
-- On failure with remaining attempts:
-  - event status becomes `retrying`
-  - retry processing job is recorded
-  - message is published to retry queue with delay
-- Retry queue dead-letters back to process queue for another attempt
-- `POST /api/v1/events/:id/replay` creates a replay request and enqueues replay dispatch
-- Replay request lifecycle is tracked in `replay_requests` and `audit_entries`
-
-## Internal Management Authentication
-
-Management/query endpoints are protected with a lightweight internal API key check suitable for local or private-network environments.
-
-- Header: `x-internal-api-key`
-- Env var: `MANAGEMENT_API_KEY`
-- Protected endpoint groups:
-  - `/api/v1/integrations`
-  - `/api/v1/events`
-  - `/api/v1/deliveries`
-  - `/api/v1/audit-entries`
-  - `/api/v1/processing-status`
-
-Public endpoints that remain accessible without this header:
-
-- `/api/v1/health`
-- `/api/v1/webhooks/:provider`
-- `/api/v1/internal/delivery-sink/:provider` (non-production helper)
+| Area                   | Implemented behavior                                                                                                     |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Provider auth          | `acme` uses HMAC SHA256 over the raw request body; `globex` uses a shared token header                                   |
+| Webhook ingestion      | `POST /api/v1/webhooks/:provider` validates provider, payload shape, and authenticity                                    |
+| Payload normalization  | Provider-specific normalizers map inbound payloads into a canonical event contract                                       |
+| Idempotency            | Redis marker + PostgreSQL uniqueness with stable payload-hash fallback                                                   |
+| Queue processing       | RabbitMQ process, retry, and replay queues with durable messages                                                         |
+| Retries                | Worker schedules exponential backoff via queue TTL and dead-letter routing                                               |
+| Replay                 | `POST /api/v1/events/:id/replay` records a replay request and republishes work                                           |
+| Redis usage            | Idempotency markers, processing locks, webhook rate limits, integration cache                                            |
+| PostgreSQL persistence | Integrations, raw webhooks, normalized events, processing jobs, delivery attempts, replay requests, audit entries        |
+| Worker runtime         | Separate worker process consumes replay and process queues                                                               |
+| Tests and CI           | Vitest unit and integration tests, ESLint, Prettier, TypeScript checks, GitHub Actions, Docker Compose config validation |
 
 ## API Overview
 
-Base path: `/api/v1`
+The README keeps the API surface high-signal. Detailed endpoint behavior, query parameters, and auth boundaries live in [docs/api-overview.md](docs/api-overview.md).
 
-- `GET /health`
-- `POST /webhooks/:provider`
-- `GET /integrations` (requires `x-internal-api-key`)
-- `GET /events` (requires `x-internal-api-key`)
-- `GET /events/:id` (requires `x-internal-api-key`)
-- `GET /events/:id/status` (requires `x-internal-api-key`)
-- `POST /events/:id/replay` (requires `x-internal-api-key`)
-- `GET /deliveries` (requires `x-internal-api-key`)
-- `GET /audit-entries` (requires `x-internal-api-key`)
-- `GET /processing-status/:id` (requires `x-internal-api-key`)
+| Family              | Routes                                                                                                                                                 | Purpose                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Health              | `GET /api/v1/health`                                                                                                                                   | Reports dependency health for PostgreSQL, Redis, and RabbitMQ                   |
+| Webhook ingress     | `POST /api/v1/webhooks/:provider`                                                                                                                      | Validates, normalizes, persists, and enqueues inbound events                    |
+| Integrations        | `GET /api/v1/integrations`                                                                                                                             | Lists configured provider integrations                                          |
+| Event operations    | `GET /api/v1/events`, `GET /api/v1/events/:id`, `GET /api/v1/events/:id/status`, `GET /api/v1/processing-status/:id`, `POST /api/v1/events/:id/replay` | Operational search, event detail, status polling, replay initiation             |
+| Delivery history    | `GET /api/v1/deliveries`                                                                                                                               | Reviews outbound delivery attempts                                              |
+| Audit trail         | `GET /api/v1/audit-entries`                                                                                                                            | Reviews recorded lifecycle actions                                              |
+| Local delivery sink | `POST /api/v1/internal/delivery-sink/:provider`                                                                                                        | Non-production helper used by local seed data to validate worker delivery paths |
 
-Response contracts:
+Management routes require `x-internal-api-key`. Webhook ingress and health remain public. The internal delivery sink is disabled when `NODE_ENV=production`.
 
-- Success: `{ "success": true, "data": ..., "meta": ... }`
-- Error: `{ "success": false, "error": { "code", "message", "details" } }`
+## Local Workflow
 
-Full request/response examples: [docs/api-overview.md](docs/api-overview.md)
+The default path is Docker-first. Compose boots PostgreSQL, Redis, RabbitMQ, a migration-and-seed job, the API, the worker, and an Nginx proxy.
 
-## Local Development (Docker)
-
-### Prerequisites
-
-- Docker Desktop or Docker Engine with Compose support
-
-### Start
+### Quick Start
 
 ```bash
 docker compose up --build -d
-```
-
-### Logs
-
-```bash
 docker compose logs -f migrator api worker
-```
-
-### Stop
-
-```bash
+curl -s http://localhost:3000/api/v1/health | jq
 docker compose down
 ```
 
-Service endpoints:
+### Service Endpoints
 
-- API: `http://localhost:3000`
-- Nginx proxy: `http://localhost:8082`
-- PostgreSQL: `localhost:5434`
-- Redis: `localhost:6381`
-- RabbitMQ AMQP: `localhost:5672`
-- RabbitMQ UI: `http://localhost:15672` (`guest` / `guest`)
+| Service       | Address                  |
+| ------------- | ------------------------ |
+| API           | `http://localhost:3000`  |
+| Nginx proxy   | `http://localhost:8082`  |
+| PostgreSQL    | `localhost:5434`         |
+| Redis         | `localhost:6381`         |
+| RabbitMQ AMQP | `localhost:5672`         |
+| RabbitMQ UI   | `http://localhost:15672` |
 
-## Local Demo Walkthrough
+### Non-Docker Workflow
 
-The following demo uses the seeded `acme` integration.
-
-1. Set a shell variable for management access:
-
-```bash
-MGMT_KEY=local-internal-management-key
-```
-
-2. Verify health:
-
-```bash
-curl -s http://localhost:3000/api/v1/health | jq
-```
-
-3. Build payload and signature:
-
-```bash
-PAYLOAD='{"eventId":"evt-demo-1001","eventType":"order.created","occurredAt":"2026-03-07T10:00:00.000Z","subject":"order-1001","data":{"id":"order-1001","total":149.5,"currency":"USD"}}'
-SIG=$(node -e "const crypto=require('crypto');const payload=process.argv[1];process.stdout.write(crypto.createHmac('sha256','acme-demo-secret').update(payload).digest('hex'))" "$PAYLOAD")
-```
-
-4. Ingest webhook:
-
-```bash
-curl -s -X POST http://localhost:3000/api/v1/webhooks/acme \
-  -H "content-type: application/json" \
-  -H "x-acme-signature: $SIG" \
-  --data "$PAYLOAD" | jq
-```
-
-5. Query events:
-
-```bash
-curl -s "http://localhost:3000/api/v1/events?page=1&pageSize=5&sortBy=receivedAt&sortOrder=desc" \
-  -H "x-internal-api-key: $MGMT_KEY" | jq
-```
-
-6. Replay an event (replace `<event-id>` with a value from step 5):
-
-```bash
-curl -s -X POST "http://localhost:3000/api/v1/events/<event-id>/replay" \
-  -H "content-type: application/json" \
-  -H "x-internal-api-key: $MGMT_KEY" \
-  --data '{"requestedBy":"local-demo","reason":"Manual replay validation"}' | jq
-```
-
-7. Inspect status, deliveries, and audit entries:
-
-```bash
-curl -s "http://localhost:3000/api/v1/events/<event-id>/status" -H "x-internal-api-key: $MGMT_KEY" | jq
-curl -s "http://localhost:3000/api/v1/deliveries?eventId=<event-id>" -H "x-internal-api-key: $MGMT_KEY" | jq
-curl -s "http://localhost:3000/api/v1/audit-entries?entityId=<event-id>" -H "x-internal-api-key: $MGMT_KEY" | jq
-```
-
-## Non-Docker Commands
-
-Use this only when intentionally running dependencies outside Docker.
+Use this only if PostgreSQL, Redis, and RabbitMQ are already running outside Compose.
 
 ```bash
 cp .env.example .env
@@ -234,65 +167,65 @@ npm run dev
 npm run worker:dev
 ```
 
-## Testing and Quality Checks
+The seed script creates `acme` and `globex` integrations and points their callback URLs at the internal delivery sink so the full ingest-to-worker loop can be exercised locally.
 
-```bash
-npm run lint
-npm run format
-npm run typecheck
-npm test
-npm run build
-```
+## Validation and Quality
 
-## Seed Data Notes
-
-Seeder initializes:
-
-- Integrations: `acme`, `globex`
-- Sample events across `processed`, `failed`, and `pending`
-- Representative processing jobs, delivery attempts, and audit entries
+| Command                             | Purpose                                            |
+| ----------------------------------- | -------------------------------------------------- |
+| `npm run lint`                      | ESLint over the codebase                           |
+| `npm run format`                    | Prettier check                                     |
+| `npm run typecheck`                 | TypeScript compile-time validation                 |
+| `npm test`                          | Vitest unit and integration coverage               |
+| `npm run build`                     | Compile API and worker output into `dist/`         |
+| `npm run verify`                    | Run lint, format, typecheck, and tests as one gate |
+| `docker compose config > /dev/null` | Validate Compose configuration                     |
 
 ## Repository Structure
 
 ```text
-src/
-  api/
-  application/
-  domain/
-  infrastructure/
-  worker/
-docs/
-tests/
-docker/
-.github/workflows/
+.
+|- src/
+|  |- api/               # Fastify app, routes, auth, response contracts
+|  |- application/       # Ingestion, replay, query, and processing services
+|  |- domain/            # Shared types and error contracts
+|  |- infrastructure/    # PostgreSQL, RabbitMQ, Redis, HTTP, config, container wiring
+|  `- worker/            # Queue consumers for replay and processing
+|- docs/                 # Architecture, domain, API, security, and workflow notes
+|- tests/                # Unit and integration coverage
+|- docker/               # Container and Nginx definitions
+`- .github/workflows/    # CI pipeline
 ```
 
-## Security Notes
+## Docs Map
 
-- Provider verification before persistence
-- Validation for route params, bodies, and query inputs
-- Redis-backed webhook rate limiting per provider/source IP
-- Redis + PostgreSQL idempotency safeguards
-- Internal API key protection for management/query routes
-- Structured audit logging for lifecycle actions
+| Document                                               | Focus                                                            |
+| ------------------------------------------------------ | ---------------------------------------------------------------- |
+| [docs/architecture.md](docs/architecture.md)           | System boundaries, queue topology, runtime responsibilities      |
+| [docs/domain-model.md](docs/domain-model.md)           | Persistence model, lifecycle records, status semantics           |
+| [docs/api-overview.md](docs/api-overview.md)           | Route families, auth boundaries, request and response contracts  |
+| [docs/webhook-flow.md](docs/webhook-flow.md)           | Ingest-to-worker lifecycle, idempotency, retries, replay         |
+| [docs/security.md](docs/security.md)                   | Verification, management auth, rate limiting, integrity controls |
+| [docs/local-development.md](docs/local-development.md) | Docker workflow, service endpoints, local validation commands    |
+| [docs/deployment-notes.md](docs/deployment-notes.md)   | Runtime split, release ordering, operational deployment notes    |
+| [docs/roadmap.md](docs/roadmap.md)                     | Grounded next steps and explicit non-implemented areas           |
 
-See [docs/security.md](docs/security.md) for details.
+## Scope Boundaries
 
-## CI
+This repository is intentionally sharp in scope. It demonstrates integration and backend reliability patterns without pretending to ship a full platform.
 
-The GitHub Actions workflow runs:
-
-- dependency install (`npm ci`)
-- lint
-- format check
-- typecheck
-- tests
-- build
-- Docker Compose config validation
+| Current boundary                           | Why it is bounded this way                                                                                            |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Two example providers: `acme` and `globex` | Enough to show the adapter and verification model without inflating the integration catalog                           |
+| Internal API key for management routes     | Suitable for private operational endpoints in this repository; not presented as end-user auth                         |
+| Local internal delivery sink               | Keeps end-to-end delivery validation self-contained for local and test flows                                          |
+| RabbitMQ TTL and dead-letter retries       | Demonstrates queue-native retry control without adding an external scheduler                                          |
+| No cloud-specific deployment manifests     | Keeps the project centered on backend behavior rather than vendor packaging                                           |
+| No standalone replay-request query API     | Replay state is persisted and auditable, but the repository does not yet expose a dedicated replay-management surface |
 
 ## Future Improvements
 
-- Dead-letter queue inspection and recovery tooling
-- OpenTelemetry traces for API, queue, and worker boundaries
-- Per-integration secret rotation workflow
-- Production deployment manifests and scaling guidance
+- Add dead-letter inspection and operator recovery tooling around failed queue messages.
+- Add metrics and tracing for queue lag, delivery latency, and retry volume.
+- Add per-integration delivery policy overrides for timeout and retry behavior.
+- Replace the shared management key with stronger service-to-service authentication for the management plane.
