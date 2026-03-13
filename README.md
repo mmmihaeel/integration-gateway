@@ -4,6 +4,8 @@ TypeScript webhook ingestion gateway for idempotent event processing, retries, r
 
 `integration-gateway` is a reviewer-friendly backend project that treats webhook ingestion as a real systems problem instead of a thin HTTP controller. The repository shows provider-specific verification at the edge, canonical event normalization, durable PostgreSQL state, RabbitMQ-backed worker processing, Redis-backed control paths, and explicit replay and audit workflows.
 
+![integration-gateway hero placeholder](assets/readme/hero.svg)
+
 ## Quick Navigation
 
 - [Why This Repository Matters](#why-this-repository-matters)
@@ -38,6 +40,8 @@ The runtime is intentionally split between synchronous ingress responsibilities 
 | PostgreSQL     | System of record for integrations, webhook events, normalized events, processing jobs, delivery attempts, replay requests, and audit entries |
 | RabbitMQ       | Durable async transport for process, retry, and replay queues                                                                                |
 | Redis          | Rate limiting, idempotency markers, processing locks, and short-lived integration cache                                                      |
+
+![integration-gateway platform topology placeholder](assets/readme/platform-topology.svg)
 
 ```mermaid
 flowchart LR
@@ -74,6 +78,8 @@ The implemented flow is:
 
 The repository separates storage by lifecycle stage so operators can answer different questions without overloading a single table or API view.
 
+![integration-gateway lifecycle overview placeholder](assets/readme/lifecycle-overview.svg)
+
 | Record              | Why it exists                                                                                         | Written by                         | Where it is surfaced                                           |
 | ------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------- | -------------------------------------------------------------- |
 | `webhook_events`    | Preserves raw payload, inbound headers, source IP, external event id, and idempotency key             | API ingestion path                 | `GET /events/:id`                                              |
@@ -82,6 +88,10 @@ The repository separates storage by lifecycle stage so operators can answer diff
 | `delivery_attempts` | Records each outbound callback attempt with HTTP metadata and latency                                 | Worker                             | `GET /deliveries`, `GET /events/:id`                           |
 | `replay_requests`   | Stores explicit operator-driven replay intent with actor and reason                                   | Replay endpoint and replay worker  | Persisted for lifecycle control; no standalone query route yet |
 | `audit_entries`     | Append-only operational history for ingestion, queueing, retries, failures, and replay actions        | API, replay service, worker        | `GET /audit-entries`                                           |
+
+### Async Processing Flow
+
+![integration-gateway async flow placeholder](assets/readme/async-flow.svg)
 
 ### Idempotency Strategy
 

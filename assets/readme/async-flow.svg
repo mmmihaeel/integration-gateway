@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">integration-gateway async flow placeholder</title>
+  <desc id="desc">Placeholder SVG for the integration-gateway README async flow asset.</desc>
+  <rect width="1280" height="640" fill="#111315"/>
+  <rect x="24" y="24" width="1232" height="592" rx="20" fill="none" stroke="#2b2f36" stroke-width="2"/>
+  <text x="640" y="304" fill="#f3f4f6" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" text-anchor="middle">integration-gateway</text>
+  <text x="640" y="352" fill="#9ca3af" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="22" text-anchor="middle">async flow placeholder</text>
+</svg>
